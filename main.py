@@ -10,8 +10,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # ============================================================
 # CONFIGURATION
 # ============================================================
-TELEGRAM_TOKEN = "METS_TON_TOKEN_ICI"
-ANTHROPIC_API_KEY = "METS_TA_CLE_ANTHROPIC_ICI"
+TELEGRAM_TOKEN =os.environ.get("TELE
+ANTHROPIC_API_KEY =os.environ.get("A
 CHAT_ID = None
 MARGE_MINIMUM = 20  # €
 
