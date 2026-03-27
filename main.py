@@ -1,3 +1,4 @@
+import os
 import asyncio
 import logging
 import json
@@ -10,8 +11,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # ============================================================
 # CONFIGURATION
 # ============================================================
-TELEGRAM_TOKEN =os.environ.get("TELEGRAM TOKEN")
-ANTHROPIC_API_KEY =os.environ.get("ANTHROPIC API KEY")
+TELEGRAM_TOKEN =os.environ.get("TELEGRAM_TOKEN")
+ANTHROPIC_API_KEY =os.environ.get("ANTHROPIC_API_KEY")
 CHAT_ID = None
 MARGE_MINIMUM = 20  # €
 
