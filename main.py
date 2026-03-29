@@ -65,7 +65,19 @@ async def search_sneaker_prices(query: str) -> str:
         )
 
         full_text = "".join(b.text for b in response.content if hasattr(b, "text"))
-        clean = full_text.replace("```json", "").replace("```", "").strip()
+
+        # Extraction robuste du JSON même si Claude ajoute du texte autour
+        clean = full_text.strip()
+        clean = clean.replace("```json", "").replace("```", "").strip()
+
+        # Cherche le premier { et le dernier } pour extraire uniquement le JSON
+        start = clean.find("{")
+        end = clean.rfind("}") + 1
+        if start == -1 or end == 0:
+            logger.error(f"Pas de JSON trouvé dans la réponse : {clean[:300]}")
+            return "❌ Sneaker non trouvée. Essaie avec un nom plus précis."
+
+        clean = clean[start:end]
         data = json.loads(clean)
 
         if "erreur" in data:
@@ -73,8 +85,9 @@ async def search_sneaker_prices(query: str) -> str:
 
         return format_sneaker_result(data)
 
-    except json.JSONDecodeError:
-        return "❌ Erreur lors de l'analyse des prix. Réessaie avec un nom plus précis."
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ JSON invalide : {e} — Réponse : {full_text[:300]}")
+        return "❌ Résultat illisible. Réessaie avec un nom plus précis ex: `Nike Dunk Low Panda`"
     except Exception as e:
         logger.error(f"❌ Erreur recherche sneaker: {e}")
         return "❌ Une erreur est survenue. Réessaie dans quelques secondes."
@@ -202,4 +215,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-  
