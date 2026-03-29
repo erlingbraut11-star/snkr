@@ -1,282 +1,205 @@
 import os
-import asyncio
-import logging
 import json
-import re
-from datetime import datetime
+import logging
 import anthropic
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
-TELEGRAM_TOKEN =os.environ.get("TELEGRAM_TOKEN")
-ANTHROPIC_API_KEY =os.environ.get("ANTHROPIC_API_KEY")
-CHAT_ID = None
-MARGE_MINIMUM = 20  # €
-
-# ============================================================
-# SYSTEM PROMPT
-# ============================================================
-SYSTEM_PROMPT = """Tu es SNKR, un expert en achat-revente de sneakers.
-
-ÉTAPE 1 — Utilise web_search pour chercher sur Vinted les sneakers récemment mises en vente de ces marques : Nike, Jordan, New Balance.
-Recherche des annonces récentes avec des prix potentiellement sous-évalués.
-
-ÉTAPE 2 — Pour chaque sneaker trouvée sur Vinted, utilise web_search pour trouver son prix actuel sur StockX (prix de revente du marché).
-
-ÉTAPE 3 — Calcule la marge NETTE réelle en tenant compte de TOUS les frais :
-
-FRAIS ACHAT VINTED :
-- Frais service acheteur : 5% du prix + 0.70€
-- Frais de port estimé : 6€
-
-FRAIS REVENTE STOCKX :
-- Commission vendeur : 9.5% du prix de vente
-- Frais de traitement : 3% du prix de vente
-- Frais de port : 13€
-
-CALCUL :
-- Coût total achat = prix_vinted + (prix_vinted × 5% + 0.70€) + 6€
-- Revenu net revente = prix_stockx - (prix_stockx × 12.5%) - 13€
-- Marge nette = Revenu net revente - Coût total achat
-
-Ne retourne QUE les sneakers avec une marge NETTE >= 20€.
-
-Réponds UNIQUEMENT avec ce JSON :
-[
-  {
-    "sneaker": "Nom exact du modèle",
-    "marque": "Nike" | "Jordan" | "New Balance",
-    "taille": "ex: 42 ou US9",
-    "etat": "Neuf" | "Très bon état" | "Bon état",
-    "prix_vinted": 95,
-    "frais_achat": 11,
-    "cout_total_achat": 106,
-    "prix_stockx": 200,
-    "frais_revente": 38,
-    "revenu_net_revente": 162,
-    "marge_nette": 56,
-    "lien_vinted": "URL de l'annonce si disponible",
-    "analyse": "Pourquoi c'est une bonne affaire en 1-2 phrases",
-    "risque": "Faible" | "Moyen" | "Élevé",
-    "verdict": "ACHÈTE" | "PASSE"
-  }
-]
-
-Si aucune bonne affaire trouvée, retourne : []
-JSON uniquement, aucun texte avant ou après."""
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# ANALYSE SNKR
+# PROMPT SCOUT SNEAKERS
 # ============================================================
-async def run_snkr_analysis():
+
+SNEAKER_PROMPT = """Tu es un expert sneakers et resell. 
+Quand on te donne le nom ou la référence SKU d'une sneaker, tu utilises web_search pour trouver :
+
+1. Le prix moyen sur StockX (cherche sur stockx.com)
+2. Le prix moyen sur Vinted (cherche sur vinted.fr)
+
+Réponds UNIQUEMENT avec ce JSON, sans texte avant ou après :
+{
+  "nom": "Nom complet de la sneaker",
+  "sku": "SKU si trouvé, sinon null",
+  "image_url": "URL image si trouvée, sinon null",
+  "stockx": {
+    "prix_moyen": "ex: 180€",
+    "fourchette": "ex: 150€ - 220€",
+    "derniere_vente": "ex: 175€",
+    "lien": "URL directe vers la sneaker sur StockX"
+  },
+  "vinted": {
+    "prix_moyen": "ex: 120€",
+    "fourchette": "ex: 90€ - 150€",
+    "annonces_trouvees": "ex: 12 annonces",
+    "lien": "URL de recherche sur Vinted"
+  },
+  "analyse": "2 phrases : est-ce une bonne affaire sur Vinted vs StockX ? Vaut-il mieux acheter ou revendre ?",
+  "verdict": "ACHETER sur Vinted 🟢 / REVENDRE sur StockX 🔴 / ATTENDRE 🟡"
+}
+
+Si tu ne trouves pas la sneaker, retourne :
+{
+  "erreur": "Sneaker non trouvée. Essaie avec un nom plus précis ou le SKU."
+}"""
+
+
+async def search_sneaker_prices(query: str) -> str:
+    """Recherche les prix d'une sneaker via Claude + web_search"""
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        logger.info("🔍 SNKR lance la recherche de bonnes affaires...")
+        logger.info(f"🔍 Recherche prix pour : {query}")
 
         response = client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=4000,
-            system=SYSTEM_PROMPT,
+            max_tokens=2000,
+            system=SNEAKER_PROMPT,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
-            messages=[{"role": "user", "content": f"Trouve les meilleures affaires sneakers Nike, Jordan, New Balance sur Vinted avec une marge minimum de {MARGE_MINIMUM}€ par rapport à StockX."}]
+            messages=[{"role": "user", "content": f"Trouve les prix de cette sneaker : {query}"}]
         )
 
-        full_text = ""
-        for block in response.content:
-            if hasattr(block, "text"):
-                full_text += block.text
-
+        full_text = "".join(b.text for b in response.content if hasattr(b, "text"))
         clean = full_text.replace("```json", "").replace("```", "").strip()
-        deals = json.loads(clean)
-        filtered = [d for d in deals if d.get("marge_nette", 0) >= MARGE_MINIMUM and d.get("verdict") == "ACHÈTE"]
-        logger.info(f"✅ {len(filtered)} bonne(s) affaire(s) trouvée(s)")
-        return filtered
+        data = json.loads(clean)
 
+        if "erreur" in data:
+            return f"❌ {data['erreur']}"
+
+        return format_sneaker_result(data)
+
+    except json.JSONDecodeError:
+        return "❌ Erreur lors de l'analyse des prix. Réessaie avec un nom plus précis."
     except Exception as e:
-        logger.error(f"❌ Erreur analyse SNKR: {e}")
-        return []
+        logger.error(f"❌ Erreur recherche sneaker: {e}")
+        return "❌ Une erreur est survenue. Réessaie dans quelques secondes."
 
-# ============================================================
-# FORMATAGE MESSAGE
-# ============================================================
-def format_deal(d):
-    risque_emoji = {"Faible": "🟢", "Moyen": "🟡", "Élevé": "🔴"}.get(d.get("risque", "Moyen"), "🟡")
-    marque_emoji = {"Nike": "✔️", "Jordan": "🏀", "New Balance": "🔵"}.get(d.get("marque", ""), "👟")
-    marge = d.get("marge_nette", 0)
-    stars = "🔥🔥" if marge >= 100 else "🔥" if marge >= 50 else "⭐"
 
-    msg = f"{stars} *{d.get('sneaker', '')}*\n"
-    msg += f"{marque_emoji} {d.get('marque', '')} · Taille {d.get('taille', '?')} · {d.get('etat', '?')}\n\n"
-    
-    msg += f"🛒 *Achat Vinted :*\n"
-    msg += f"  Prix annonce : {d.get('prix_vinted', '?')}€\n"
-    msg += f"  Frais Vinted + port : {d.get('frais_achat', '?')}€\n"
-    msg += f"  💸 Coût total : *{d.get('cout_total_achat', '?')}€*\n\n"
-    
-    msg += f"📈 *Revente StockX :*\n"
-    msg += f"  Prix marché : {d.get('prix_stockx', '?')}€\n"
-    msg += f"  Commissions + port : {d.get('frais_revente', '?')}€\n"
-    msg += f"  💰 Revenu net : *{d.get('revenu_net_revente', '?')}€*\n\n"
-    
-    msg += f"✅ *Marge nette réelle : {marge}€*\n\n"
-    msg += f"📊 {d.get('analyse', '')}\n\n"
-    msg += f"{risque_emoji} *Risque :* {d.get('risque', '?')}\n"
+def format_sneaker_result(data: dict) -> str:
+    """Formate le résultat en message Telegram lisible"""
 
-    if d.get("lien_vinted") and d["lien_vinted"] != "URL de l'annonce si disponible":
-        msg += f"🔗 [Voir l'annonce Vinted]({d['lien_vinted']})\n"
+    verdict = data.get("verdict", "")
+    stockx = data.get("stockx", {})
+    vinted = data.get("vinted", {})
 
-    msg += f"\n🎯 _{d.get('verdict', '')}_"
+    msg = f"👟 *{data.get('nom', 'Sneaker')}*"
+
+    if data.get("sku"):
+        msg += f"\n🏷️ SKU : `{data['sku']}`"
+
+    msg += "\n\n"
+
+    # StockX
+    msg += "📦 *StockX*\n"
+    msg += f"  💰 Prix moyen : *{stockx.get('prix_moyen', 'N/A')}*\n"
+    msg += f"  📊 Fourchette : {stockx.get('fourchette', 'N/A')}\n"
+    msg += f"  🕐 Dernière vente : {stockx.get('derniere_vente', 'N/A')}\n"
+    if stockx.get("lien"):
+        msg += f"  🔗 [Voir sur StockX]({stockx['lien']})\n"
+
+    msg += "\n"
+
+    # Vinted
+    msg += "🛍️ *Vinted*\n"
+    msg += f"  💰 Prix moyen : *{vinted.get('prix_moyen', 'N/A')}*\n"
+    msg += f"  📊 Fourchette : {vinted.get('fourchette', 'N/A')}\n"
+    msg += f"  📋 Annonces : {vinted.get('annonces_trouvees', 'N/A')}\n"
+    if vinted.get("lien"):
+        msg += f"  🔗 [Voir sur Vinted]({vinted['lien']})\n"
+
+    msg += "\n"
+
+    # Analyse
+    msg += f"📊 *Analyse :*\n{data.get('analyse', '')}\n\n"
+
+    # Verdict
+    msg += f"🎯 *Verdict :* {verdict}"
+
     return msg
 
-def format_daily_message(deals):
-    now = datetime.now().strftime("%d/%m/%Y %H:%M")
-
-    if not deals:
-        return (
-            "👟 *SNKR — Scan du jour*\n"
-            f"📅 {now}\n\n"
-            f"Aucune bonne affaire avec {MARGE_MINIMUM}€+ de marge trouvée pour l'instant.\n"
-            "SNKR continue de surveiller ! 👀"
-        )
-
-    total_marge = sum(d.get("marge_nette", 0) for d in deals)
-    header = (
-        f"👟 *SNKR — Bonnes affaires du {now}*\n"
-        f"🔥 *{len(deals)} affaire(s) détectée(s) · {MARGE_MINIMUM}€+ de marge*\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    )
-
-    body = "\n\n━━━━━━━━━━━━━━━━━━━━━━\n\n".join(format_deal(d) for d in deals)
-
-    footer = (
-        f"\n\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 *Marge totale potentielle : {total_marge}€*\n"
-        "⚠️ _Vérifie toujours l'annonce avant d'acheter._"
-    )
-
-    return header + body + footer
-
-# ============================================================
-# ENVOI TELEGRAM
-# ============================================================
-async def send_deals(bot=None, chat_id=None):
-    target_chat = chat_id or CHAT_ID
-    if not target_chat or not bot:
-        logger.warning("⚠️ Chat ID non défini. Envoie /start au bot d'abord.")
-        return
-
-    try:
-        await bot.send_message(
-            chat_id=target_chat,
-            text="🔍 *SNKR scanne Vinted & StockX...*\n_Recherche des meilleures affaires — patiente 30 secondes !_",
-            parse_mode="Markdown"
-        )
-
-        deals = await run_snkr_analysis()
-        message = format_daily_message(deals)
-
-        if len(message) > 4000:
-            chunks = [message[i:i+4000] for i in range(0, len(message), 4000)]
-            for chunk in chunks:
-                await bot.send_message(chat_id=target_chat, text=chunk, parse_mode="Markdown")
-        else:
-            await bot.send_message(chat_id=target_chat, text=message, parse_mode="Markdown")
-
-        logger.info(f"✅ Deals envoyés à {target_chat}")
-
-    except Exception as e:
-        logger.error(f"❌ Erreur envoi: {e}")
-        if bot and target_chat:
-            await bot.send_message(chat_id=target_chat, text=f"❌ Erreur SNKR: {str(e)}")
 
 # ============================================================
 # COMMANDES TELEGRAM
 # ============================================================
+
 async def start_command(update, context):
-    global CHAT_ID
-    CHAT_ID = str(update.effective_chat.id)
-
     await update.message.reply_text(
-        "👟 *SNKR est en ligne !*\n\n"
-        "Je scanne Vinted & StockX pour trouver les meilleures affaires Nike, Jordan et New Balance.\n\n"
-        f"🎯 *Marge minimum :* {MARGE_MINIMUM}€\n"
-        "⏰ *Scan automatique :* 3x par jour (9h, 13h, 18h)\n\n"
-        "📋 *Commandes :*\n"
-        "/scan — Lancer un scan immédiat\n"
-        "/status — Vérifier que SNKR fonctionne\n"
-        "/aide — Afficher l'aide\n\n"
-        "👟 Prêt à trouver des pépites !",
+        "👟 *SneakerBot — Scanner de prix*\n\n"
+        "Je compare les prix sur *StockX* et *Vinted* pour n'importe quelle sneaker.\n\n"
+        "📋 *Comment utiliser :*\n"
+        "• Tape directement le nom de la sneaker\n"
+        "• Ou envoie le SKU (ex: `555088-134`)\n\n"
+        "📌 *Exemples :*\n"
+        "`Air Jordan 1 Retro High OG Bred`\n"
+        "`Nike Dunk Low Panda`\n"
+        "`Yeezy Boost 350 V2 Zebra`\n"
+        "`555088-134`\n\n"
+        "/help — Aide\n\n"
+        "Lance une recherche ! 🚀",
         parse_mode="Markdown"
     )
 
-async def scan_command(update, context):
-    global CHAT_ID
-    CHAT_ID = str(update.effective_chat.id)
-    await send_deals(bot=context.bot, chat_id=CHAT_ID)
 
-async def status_command(update, context):
+async def help_command(update, context):
     await update.message.reply_text(
-        "✅ *SNKR est opérationnel !*\n\n"
-        "🔍 Surveille : Vinted → StockX\n"
-        "👟 Marques : Nike, Jordan, New Balance\n"
-        f"💶 Marge minimum : {MARGE_MINIMUM}€\n"
-        "⏰ Scans : 9h, 13h et 18h chaque jour",
+        "📖 *Aide SneakerBot*\n\n"
+        "Tape le nom ou le SKU d'une sneaker et je te donne :\n\n"
+        "• 💰 Le prix moyen sur *StockX*\n"
+        "• 🛍️ Le prix moyen sur *Vinted*\n"
+        "• 📊 La fourchette de prix\n"
+        "• 🎯 Un verdict : acheter ou revendre ?\n\n"
+        "⏱️ La recherche prend environ 15-20 secondes.",
         parse_mode="Markdown"
     )
 
-async def aide_command(update, context):
-    await update.message.reply_text(
-        "📋 *Aide SNKR*\n\n"
-        "/start — Démarrer le bot\n"
-        "/scan — Scanner maintenant\n"
-        "/status — Vérifier le statut\n"
-        "/aide — Ce message\n\n"
-        f"💶 Marge minimum configurée : {MARGE_MINIMUM}€\n\n"
-        "⚠️ _Vérifie toujours les annonces avant d'acheter._",
-        parse_mode="Markdown"
-    )
 
 async def message_handler(update, context):
+    query = update.message.text.strip()
+
+    if len(query) < 3:
+        await update.message.reply_text("❌ Tape un nom de sneaker plus précis !")
+        return
+
     await update.message.reply_text(
-        "Utilise /scan pour chercher des affaires, ou /aide pour les commandes. 👟"
+        f"🔍 *Recherche en cours...*\n`{query}`\n\n_Patiente 15-20 secondes !_",
+        parse_mode="Markdown"
     )
 
+    result = await search_sneaker_prices(query)
+
+    await update.message.reply_text(
+        result,
+        parse_mode="Markdown",
+        disable_web_page_preview=False
+    )
+
+
 # ============================================================
-# PLANIFICATEUR
+# MAIN
 # ============================================================
-async def post_init(application):
-    scheduler = AsyncIOScheduler(timezone="Europe/Paris")
-    # Scan 3x par jour : 9h, 13h, 18h
-    for hour in [9, 13, 18]:
-        scheduler.add_job(
-            send_deals,
-            trigger="cron",
-            hour=hour,
-            minute=0,
-            kwargs={"bot": application.bot, "chat_id": CHAT_ID}
-        )
-    scheduler.start()
-    logger.info("⏰ Planificateur démarré — scans à 9h, 13h et 18h")
 
 def main():
-    logger.info("🚀 Démarrage de SNKR Bot...")
+    if not TELEGRAM_TOKEN:
+        raise ValueError("❌ TELEGRAM_TOKEN manquant !")
+    if not ANTHROPIC_API_KEY:
+        raise ValueError("❌ ANTHROPIC_API_KEY manquant !")
 
-    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    logger.info("🚀 Démarrage SneakerBot...")
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("scan", scan_command))
-    app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(CommandHandler("aide", aide_command))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-    logger.info("✅ SNKR Bot est en ligne !")
+    logger.info("✅ SneakerBot est en ligne !")
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
+  
